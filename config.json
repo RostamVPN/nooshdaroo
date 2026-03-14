@@ -2,39 +2,22 @@
   "transport": {
     "dnstt": {
       "domains": [
-        { "domain": "t.cdn.cdn-relay-eu.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.cdn-proxy-edge.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.static-cdn-proxy.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.edge-cache-proxy.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.cdnproxy-eu.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.copper-fern-studio.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.silver-birch-labs.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.golden-maple-works.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.iron-pine-craft.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
-        { "domain": "t.cdn.bright-elm-studio.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" }
+        { "domain": "t.example.com", "pubkey": "<your-server-pubkey-hex>" }
       ],
       "udp_resolvers": [
-        "172.65.171.181",
         "8.8.8.8",
-        "8.8.4.4",
         "1.1.1.1",
-        "1.0.0.1",
-        "9.9.9.9",
-        "149.112.112.112",
-        "208.67.222.222",
-        "208.67.220.220"
+        "9.9.9.9"
       ]
     }
   },
   "ota": {
-    "domain": "_cfg.nooshdaroo.cdn.cdncache-eu.net",
-    "nonce": "rostam-dns-a"
+    "domain": "_cfg.example.com",
+    "nonce": "your12charnc"
   },
   "cover_domains": [
     "www.google.com",
     "www.youtube.com",
-    "www.wikipedia.org",
-    "www.instagram.com",
-    "www.twitter.com"
+    "www.wikipedia.org"
   ]
 }
