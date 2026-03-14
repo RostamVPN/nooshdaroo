@@ -5,6 +5,7 @@ use std::sync::Arc;
 mod chrome_cover;
 mod config;
 mod dns_codec;
+mod iran_ranges;
 mod tunnel;
 mod ui;
 
@@ -57,6 +58,14 @@ struct Args {
     /// Scan for working DNS resolvers before connecting
     #[arg(long)]
     scan_resolvers: bool,
+
+    /// Scan Iran IP ranges for working resolvers (auto-detects your ISP)
+    #[arg(long)]
+    scan_iran: bool,
+
+    /// Limit Iran scan to a specific CIDR (e.g. "5.160.100.0/24" or "5.160.0.0/16")
+    #[arg(long, value_name = "CIDR")]
+    scan_cidr: Option<String>,
 
     /// Fetch fresh config from OTA before connecting
     #[arg(long)]
@@ -186,6 +195,59 @@ async fn main() {
     // Build resolver list
     let resolvers = if let Some(ref r) = args.resolver {
         vec![r.clone()]
+    } else if args.scan_iran || args.scan_cidr.is_some() {
+        // Iran-specific resolver scan: detect local IP → scan ISP ranges
+        let probe_domain = domains.first()
+            .map(|(d, _)| d.as_str())
+            .unwrap_or("t.example.com");
+
+        let candidates = if let Some(ref cidr_str) = args.scan_cidr {
+            // User-specified CIDR range (e.g. "5.160.100.0/24")
+            if !args.quiet {
+                ui::print_status("Scan", &format!("Scanning {} for resolvers...", cidr_str));
+            }
+            parse_cidr_candidates(cidr_str, 10000)
+        } else {
+            // Auto-detect local IP and generate smart candidate list
+            let local_ip = iran_ranges::detect_local_ip();
+            if !args.quiet {
+                if let Some(ip) = local_ip {
+                    let isp_name = iran_ranges::find_isp(ip)
+                        .map(|g| g.name)
+                        .unwrap_or("Unknown ISP");
+                    ui::print_status("Detected", &format!("{} ({})", ip, isp_name));
+                } else {
+                    ui::print_status("Scan", "Could not detect local IP, scanning all Iran ranges");
+                }
+            }
+            let ips = iran_ranges::generate_scan_candidates(local_ip, 5000);
+            if !args.quiet {
+                ui::print_status("Scan", &format!("Probing {} candidate resolvers...", ips.len()));
+            }
+            ips.iter().map(|ip| ip.to_string()).collect()
+        };
+
+        let results = tunnel::scan_resolvers(&candidates, probe_domain, 4000).await;
+
+        if results.is_empty() {
+            ui::print_error("No working resolvers found in scan range.");
+            ui::print_hint("Try a larger range: --scan-cidr 5.160.0.0/16");
+            ui::print_hint("Or specify a resolver manually: --resolver <IP>");
+            std::process::exit(1);
+        }
+
+        if !args.quiet {
+            ui::print_status("Found", &format!(
+                "{} working resolvers (scanned {})", results.len(), candidates.len()
+            ));
+            for (ip, ms) in results.iter().take(10) {
+                ui::print_dim(&format!("  {} ({}ms)", ip, ms));
+            }
+        }
+
+        let working: Vec<String> = results.iter().map(|(ip, _)| ip.clone()).collect();
+        save_resolver_cache(&working);
+        working
     } else if args.scan_resolvers {
         if !args.quiet {
             ui::print_status("Scan", "Searching for working resolvers...");
@@ -206,8 +268,8 @@ async fn main() {
 
         if results.is_empty() {
             ui::print_error("No working resolvers found.");
-            ui::print_hint("Your network may be blocking DNS to the server.");
-            ui::print_hint("Try a different network or use --resolver <IP> manually.");
+            ui::print_hint("If you're in Iran, try: --scan-iran");
+            ui::print_hint("Or specify a resolver manually: --resolver <IP>");
             std::process::exit(1);
         }
 
@@ -409,4 +471,31 @@ fn cache_file_path() -> String {
     } else {
         CACHE_FILE.to_string()
     }
+}
+
+/// Parse a CIDR string (e.g. "5.160.100.0/24") and generate all host IPs.
+fn parse_cidr_candidates(cidr_str: &str, max: usize) -> Vec<String> {
+    let parts: Vec<&str> = cidr_str.split('/').collect();
+    if parts.len() != 2 { return Vec::new(); }
+
+    let base_ip: std::net::Ipv4Addr = match parts[0].parse() {
+        Ok(ip) => ip,
+        Err(_) => return Vec::new(),
+    };
+    let prefix_len: u8 = match parts[1].parse() {
+        Ok(p) if p <= 32 => p,
+        _ => return Vec::new(),
+    };
+
+    let base = u32::from(base_ip);
+    let mask = if prefix_len == 0 { 0 } else { !0u32 << (32 - prefix_len) };
+    let network = base & mask;
+    let host_count = 1u32 << (32 - prefix_len);
+
+    let mut candidates = Vec::new();
+    // Skip network address (.0) and broadcast (.255 for /24)
+    for i in 1..host_count.saturating_sub(1).min(max as u32) {
+        candidates.push(std::net::Ipv4Addr::from(network + i).to_string());
+    }
+    candidates
 }
