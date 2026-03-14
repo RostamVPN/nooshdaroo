@@ -1,6 +1,6 @@
 [package]
 name = "nooshdaroo"
-version = "1.0.0"
+version = "2.4.0"
 edition = "2021"
 description = "Nooshdaroo — Censorship-resistant SOCKS5 proxy over DNS tunneling. One binary."
 license = "MIT"
