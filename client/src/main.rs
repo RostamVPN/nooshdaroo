@@ -7,6 +7,7 @@ mod config;
 mod dns_codec;
 mod iran_ranges;
 mod russia_ranges;
+mod spirit;
 mod tunnel;
 mod ui;
 
