@@ -1,7 +1,17 @@
 # Nooshdaroo
 
-Censorship-resistant proxy that tunnels internet traffic through invisible channels.
+**نوشدارو** — Censorship-resistant proxy that tunnels internet traffic through invisible channels.
 One binary. No external dependencies at runtime.
+
+> **پاینده ایران** — *Payandeh Iran*
+>
+> Each time Nooshdaroo connects, it honors one of the heroes who paid the ultimate
+> price for Iran's freedom. A different name rotates daily — from Mahsa Amini to
+> Neda Agha-Soltan, from Kian Pirfalak to Navid Afkari, and the 30,000+ souls
+> of January 8-9, 2026.
+>
+> The [101 Names of Ahura Mazda](https://en.wikipedia.org/wiki/101_Names_of_God_(Zoroastrianism))
+> from the Hormazd Yasht are embedded in the binary. Never printed. Always present.
 
 ## Quick Start — Just Run It
 
@@ -9,15 +19,13 @@ The binary works with zero arguments — 10 tunnel domains and 8 resolvers are b
 
 ```bash
 # Linux
-curl -LO https://nooshdaroo.net/dist/nooshdaroo-linux-x86_64
-chmod +x nooshdaroo-linux-x86_64
-./nooshdaroo-linux-x86_64
+curl -LO https://nooshdaroo.net/dist/nooshdaroo-linux-x86_64 && chmod +x nooshdaroo-linux-x86_64 && ./nooshdaroo-linux-x86_64
 
-# macOS (remove quarantine first)
-curl -LO https://nooshdaroo.net/dist/nooshdaroo-macos-universal
-chmod +x nooshdaroo-macos-universal
-xattr -d com.apple.quarantine nooshdaroo-macos-universal
-./nooshdaroo-macos-universal
+# macOS
+curl -LO https://nooshdaroo.net/dist/nooshdaroo-macos-universal && chmod +x nooshdaroo-macos-universal && ./nooshdaroo-macos-universal
+
+# Windows (PowerShell)
+Invoke-WebRequest https://nooshdaroo.net/dist/nooshdaroo-windows-x86_64.exe -OutFile nooshdaroo.exe; .\nooshdaroo.exe
 
 # Then use the SOCKS5 proxy:
 curl --proxy socks5h://127.0.0.1:1080 https://icanhazip.com
@@ -31,16 +39,20 @@ In some networks (Iran, Russia, China), public DNS resolvers like 8.8.8.8 are
 blocked. Nooshdaroo can scan your local ISP network to find resolvers that work:
 
 ```bash
-# Auto-detect your ISP and scan for working resolvers:
+# Iran — auto-detect ISP, adaptive scan:
 ./nooshdaroo --scan-iran
+
+# Russia — same adaptive scanner for Russian ISPs:
+./nooshdaroo --scan-russia
 
 # Or target a specific subnet:
 ./nooshdaroo --scan-cidr 5.160.100.0/24
 ./nooshdaroo --scan-cidr 151.246.0.0/16
 ```
 
-The scanner detects your local IP, identifies your ISP (MCI, Irancell, TCI, Shatel,
-etc.), and probes your /24 first, then expands outward. Working resolvers are cached
+The scanner detects your local IP, identifies your ISP (Iran: MCI, Irancell, TCI,
+Shatel, etc. Russia: Rostelecom, MTS, Beeline, Megafon, Tele2, ER-Telecom),
+and probes your /24 first, then expands outward. Working resolvers are cached
 for next run.
 
 ## How It Works
@@ -168,6 +180,7 @@ Options:
       --tunnels <N>          Parallel tunnels [default: 2]
       --scan-resolvers       Scan well-known resolvers for working ones
       --scan-iran            Scan Iran IP ranges for resolvers (auto-detects ISP)
+      --scan-russia          Scan Russia IP ranges for resolvers (auto-detects ISP)
       --scan-cidr <CIDR>     Scan a specific CIDR for resolvers (e.g. "5.160.0.0/16")
       --ota-refresh          Fetch OTA config update
       --ota-domain <DOMAIN>  OTA config domain
@@ -279,10 +292,13 @@ or vice versa.
 - **smux v2**: Stream multiplexing (multiple TCP connections over one tunnel)
 - **SOCKS5**: Server-side proxy for outbound connections
 
-### Iran Resolver Scanner
+### Resolver Scanner (Iran + Russia)
 
-The client embeds CIDR ranges for 8 major Iranian ISPs (MCI, Irancell, TCI, DCI,
-Rightel, Shatel, ParsOnline, Asiatech). When `--scan-iran` is used:
+The client embeds complete RIPE NCC IP allocations — 1,920 Iran CIDRs and 11,256
+Russia CIDRs — in a packed binary format (5 bytes per entry, O(log n) lookup).
+ISP groups provide additional coverage for domestically-routed blocks.
+
+When `--scan-iran` or `--scan-russia` is used:
 
 1. Detects local IP via UDP socket introspection
 2. Identifies the user's ISP from embedded CIDR→ASN mapping
