@@ -14,6 +14,7 @@
         { "domain": "t.cdn.bright-elm-studio.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" }
       ],
       "udp_resolvers": [
+        "172.65.171.181",
         "8.8.8.8",
         "8.8.4.4",
         "1.1.1.1",
