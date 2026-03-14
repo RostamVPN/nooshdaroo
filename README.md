@@ -236,9 +236,37 @@ This spreads load across domains and makes blocking harder.
 - No secrets compiled into the binary
 - Cover traffic reduces DNS fingerprinting risk
 
+## OTA Config Publishing
+
+Operators can push config updates to clients via encrypted DNS TXT records:
+
+```bash
+pip3 install cryptography boto3
+
+# Publish config to Route53:
+python3 tools/publish-ota.py config.json \
+  --zone-id <ROUTE53_ZONE_ID> \
+  --domain _cfg.yourdomain.com \
+  --nonce "your12charnc"
+
+# Verify published records:
+python3 tools/publish-ota.py --verify \
+  --domain _cfg.yourdomain.com \
+  --nonce "your12charnc"
+
+# Fetch and dump existing config:
+python3 tools/publish-ota.py --fetch \
+  --domain _cfg.yourdomain.com \
+  --nonce "your12charnc"
+```
+
+Clients fetch OTA updates with `--ota-domain` and `--ota-nonce`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+Copyright (c) 2025-2026 RostamVPN (Axion Networks Inc.)
 
 ## Acknowledgments
 
