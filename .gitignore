@@ -2,5 +2,6 @@
 Cargo.lock
 *.swp
 *.swo
-*~
 .DS_Store
+*.log
+.nooshdaroo-cache.json

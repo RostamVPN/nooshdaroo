@@ -1,33 +1,8 @@
-[package]
-name = "nooshdaroo"
-version = "1.0.0"
-edition = "2021"
-description = "Nooshdaroo — Censorship-resistant SOCKS5 proxy. Tunnels internet traffic through DNS to bypass filtering."
-license = "GPL-3.0"
-homepage = "https://nooshdaroo.net"
-repository = "https://github.com/RostamVPN/nooshdaroo"
-keywords = ["proxy", "socks5", "dns-tunnel", "censorship", "privacy"]
-categories = ["command-line-utilities", "network-programming"]
-authors = ["Rostam Team <team@rostam.app>"]
-readme = "README.md"
+[workspace]
+members = ["client", "server"]
+resolver = "2"
 
-[[bin]]
-name = "nooshdaroo"
-path = "src/main.rs"
-
-[dependencies]
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-log = "0.4"
-env_logger = "0.11"
-clap = { version = "4", features = ["derive"] }
-rand = "0.8"
-ctrlc = "3.4"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
+# Client: optimise for size (DNS tunnel = bandwidth-constrained)
 [profile.release]
 opt-level = "z"
 lto = true

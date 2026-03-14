@@ -1,0 +1,10 @@
+{
+  "server_id": "my-server",
+  "listen": "0.0.0.0:53",
+  "privkey": "c051797c9a4ff0cb58b790dcb99838f2d8bca5ba02e3973906380cdd9d95d05e",
+  "upstream": "socks5",
+  "domains": ["t.example.com"],
+  "reuseport": false,
+  "idle_timeout_sec": 120,
+  "max_streams": 4096
+}

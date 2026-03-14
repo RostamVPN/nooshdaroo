@@ -87,15 +87,11 @@ pub fn print_banner() {
     );
     eprintln!();
     eprintln!(
-        "  {}{}v{}{}  {}|{}  {}https://nooshdaroo.net{}",
-        c.bold, c.green, VERSION, c.reset, c.dim, c.reset, c.dim, c.reset
+        "  {}{}v{}{}",
+        c.bold, c.green, VERSION, c.reset
     );
     eprintln!(
-        "  {}Censorship-resistant SOCKS5 proxy  |  by RostamVPN{}",
-        c.dim, c.reset
-    );
-    eprintln!(
-        "  {}{}",
+        "  {}Censorship-resistant SOCKS5 proxy over DNS tunneling{}",
         c.dim, c.reset
     );
     eprintln!();
@@ -205,7 +201,6 @@ pub fn print_config_info(cfg: &Config) {
     let c = colors();
     let domains = cfg.dnstt_domains();
     let resolvers = cfg.dnstt_resolvers();
-    let sushmode = cfg.sushmode_servers();
 
     eprintln!(
         "  {}{}Configuration{}",
@@ -231,17 +226,13 @@ pub fn print_config_info(cfg: &Config) {
         );
     }
     eprintln!();
-    eprintln!(
-        "  {}SushMode Servers ({}):{}", c.dim, sushmode.len(), c.reset
-    );
-    for s in &sushmode {
-        eprintln!("    {}{}:53{}", c.green, s, c.reset);
+    let pubkey = cfg.default_pubkey();
+    if !pubkey.is_empty() {
+        eprintln!(
+            "  {}Default pubkey: {}...{}",
+            c.dim, &pubkey[..16.min(pubkey.len())], c.reset
+        );
     }
-    eprintln!();
-    eprintln!(
-        "  {}Default pubkey: {}...{}",
-        c.dim, &cfg.default_pubkey()[..16], c.reset
-    );
 }
 
 /// Print shutdown message

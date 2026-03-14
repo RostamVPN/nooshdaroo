@@ -1,0 +1,42 @@
+[package]
+name = "nooshdaroo"
+version = "1.0.0"
+edition = "2021"
+description = "Nooshdaroo — Censorship-resistant SOCKS5 proxy over DNS tunneling. One binary."
+license = "MIT"
+keywords = ["proxy", "socks5", "dns-tunnel", "censorship", "privacy"]
+categories = ["command-line-utilities", "network-programming"]
+readme = "../README.md"
+
+[[bin]]
+name = "nooshdaroo"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["net", "time", "sync", "io-util", "macros", "rt-multi-thread", "signal"] }
+
+# KCP ARQ (reliable transport over unreliable DNS)
+kcp = "0.6"
+
+# Noise_NK crypto (wire-compatible with Go dnstt-server)
+snow = "0.9"
+
+# DNS config OTA decryption (optional, for --ota-refresh)
+chacha20poly1305 = "0.10"
+base64 = "0.22"
+
+# Core
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+hex = "0.4"
+ctrlc = "3.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
