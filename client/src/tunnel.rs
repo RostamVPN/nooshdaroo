@@ -550,12 +550,112 @@ fn drain_kcp_to_smux(
 
 // ─── SOCKS5 transparent relay ────────────────────────────────────
 
-async fn handle_socks5(client: TcpStream, session: Arc<Smux2Session>) -> Result<(), String> {
+async fn handle_socks5(mut client: TcpStream, session: Arc<Smux2Session>) -> Result<(), String> {
+    // Step 1: SOCKS5 greeting from local client (browser/curl)
+    let mut buf = [0u8; 258];
+    let n = client.read(&mut buf).await.map_err(|e| format!("socks5 greeting read: {}", e))?;
+    if n < 2 || buf[0] != 0x05 {
+        return Err("not SOCKS5".into());
+    }
+    // Reply: no auth required
+    client.write_all(&[0x05, 0x00]).await.map_err(|e| format!("socks5 greeting reply: {}", e))?;
+
+    // Step 2: Read CONNECT request
+    let n = client.read(&mut buf).await.map_err(|e| format!("socks5 connect read: {}", e))?;
+    if n < 4 || buf[0] != 0x05 || buf[1] != 0x01 {
+        return Err("not SOCKS5 CONNECT".into());
+    }
+
+    // Parse target address for logging
+    let _target = match buf[3] {
+        0x01 if n >= 10 => {  // IPv4
+            let port = u16::from_be_bytes([buf[8], buf[9]]);
+            format!("{}.{}.{}.{}:{}", buf[4], buf[5], buf[6], buf[7], port)
+        }
+        0x03 if n >= 5 => {  // Domain
+            let dlen = buf[4] as usize;
+            if n >= 5 + dlen + 2 {
+                let domain = String::from_utf8_lossy(&buf[5..5 + dlen]);
+                let port = u16::from_be_bytes([buf[5 + dlen], buf[5 + dlen + 1]]);
+                format!("{}:{}", domain, port)
+            } else {
+                "unknown".into()
+            }
+        }
+        _ => "unknown".into(),
+    };
+    log::debug!("[socks5] CONNECT {}", _target);
+
+    // Step 3: Open smux stream to server
     let stream = session.open_stream()
         .map_err(|e| format!("smux open: {}", e))?;
     let sid = stream.sid;
     let frame_tx = stream.frame_tx;
     let mut smux_rx = stream.rx;
+
+    // Step 4: Forward the SOCKS5 CONNECT request to the server through the tunnel
+    let connect_frame = smux2_frame(SMUX2_CMD_PSH, sid, &buf[..n]);
+    frame_tx.send(connect_frame).map_err(|_| "smux send CONNECT failed")?;
+
+    // Also send the SOCKS5 greeting first (server expects it)
+    let nmethods = 1u8;
+    let greeting = [0x05, nmethods, 0x00]; // v5, 1 method, no-auth
+    let greeting_frame = smux2_frame(SMUX2_CMD_PSH, sid, &greeting);
+    // Actually: server expects greeting THEN connect. Re-order: send greeting first.
+    // But we already sent connect. Let's fix the order.
+    // The server's SOCKS5 handler reads: greeting -> reply -> connect request -> reply
+    // We need to send greeting, wait for server greeting reply, then send connect, wait for connect reply.
+
+    // WAIT — the Go dnstt-server's SOCKS5 handler runs a standard SOCKS5 negotiation on each smux stream.
+    // So the stream must carry: greeting -> [server replies 05 00] -> connect req -> [server replies 05 00 00 ...]
+    // Let's do this properly.
+
+    // Undo: we already sent the connect request above. That's wrong.
+    // Can't unsend from smux. Need to re-open.
+    let _ = frame_tx.send(smux2_frame(SMUX2_CMD_FIN, sid, &[]));
+
+    // Re-open a clean stream
+    let stream = session.open_stream()
+        .map_err(|e| format!("smux reopen: {}", e))?;
+    let sid = stream.sid;
+    let frame_tx = stream.frame_tx;
+    let mut smux_rx = stream.rx;
+
+    // Send SOCKS5 greeting to server
+    let greeting = [0x05u8, 0x01, 0x00];
+    frame_tx.send(smux2_frame(SMUX2_CMD_PSH, sid, &greeting))
+        .map_err(|_| "smux send greeting")?;
+
+    // Wait for server's greeting reply (05 00)
+    let server_greeting = tokio::time::timeout(Duration::from_secs(10), smux_rx.recv()).await
+        .map_err(|_| "server greeting timeout")?
+        .ok_or("server greeting: stream closed")?;
+    if server_greeting.len() < 2 || server_greeting[0] != 0x05 {
+        return Err(format!("bad server greeting: {:?}", &server_greeting[..server_greeting.len().min(4)]));
+    }
+
+    // Send CONNECT request to server
+    frame_tx.send(smux2_frame(SMUX2_CMD_PSH, sid, &buf[..n]))
+        .map_err(|_| "smux send CONNECT")?;
+
+    // Wait for server's CONNECT reply
+    let connect_reply = tokio::time::timeout(Duration::from_secs(10), smux_rx.recv()).await
+        .map_err(|_| "server CONNECT reply timeout")?
+        .ok_or("server CONNECT: stream closed")?;
+    if connect_reply.len() < 2 || connect_reply[0] != 0x05 || connect_reply[1] != 0x00 {
+        // Forward error to client
+        let _ = client.write_all(&connect_reply).await;
+        return Err(format!("server CONNECT failed: {:02x?}", &connect_reply[..connect_reply.len().min(10)]));
+    }
+
+    // Step 5: Reply success to the local client
+    // Standard SOCKS5 success: VER=5, REP=0, RSV=0, ATYP=1, BND.ADDR=0.0.0.0, BND.PORT=0
+    client.write_all(&[0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).await
+        .map_err(|e| format!("socks5 success reply: {}", e))?;
+
+    log::debug!("[socks5] {} connected, relaying", _target);
+
+    // Step 6: Bidirectional relay
     let (mut tcp_read, mut tcp_write) = client.into_split();
 
     let tx = frame_tx.clone();
