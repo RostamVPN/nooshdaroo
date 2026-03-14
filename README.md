@@ -3,28 +3,50 @@
 Censorship-resistant proxy that tunnels internet traffic through invisible channels.
 One binary. No external dependencies at runtime.
 
-## Quick Start — Connect in 3 Commands
+## Quick Start — Just Run It
+
+The binary works with zero arguments — 10 tunnel domains and 8 resolvers are built in.
 
 ```bash
-# 1. Download
+# Linux
 curl -LO https://nooshdaroo.net/dist/nooshdaroo-linux-x86_64
-curl -LO https://nooshdaroo.net/dist/config.json
 chmod +x nooshdaroo-linux-x86_64
+./nooshdaroo-linux-x86_64
 
-# 2. Connect
-./nooshdaroo-linux-x86_64 -c config.json
+# macOS (remove quarantine first)
+curl -LO https://nooshdaroo.net/dist/nooshdaroo-macos-universal
+chmod +x nooshdaroo-macos-universal
+xattr -d com.apple.quarantine nooshdaroo-macos-universal
+./nooshdaroo-macos-universal
 
-# 3. Use it
+# Then use the SOCKS5 proxy:
 curl --proxy socks5h://127.0.0.1:1080 https://icanhazip.com
 ```
 
 Pre-built binaries for Linux, macOS, and Windows: **[nooshdaroo.net/dist/](https://nooshdaroo.net/dist/)**
 
+### If global resolvers are blocked
+
+In some networks (Iran, Russia, China), public DNS resolvers like 8.8.8.8 are
+blocked. Nooshdaroo can scan your local ISP network to find resolvers that work:
+
+```bash
+# Auto-detect your ISP and scan for working resolvers:
+./nooshdaroo --scan-iran
+
+# Or target a specific subnet:
+./nooshdaroo --scan-cidr 5.160.100.0/24
+./nooshdaroo --scan-cidr 151.246.0.0/16
+```
+
+The scanner detects your local IP, identifies your ISP (MCI, Irancell, TCI, Shatel,
+etc.), and probes your /24 first, then expands outward. Working resolvers are cached
+for next run.
+
 ## How It Works
 
-Nooshdaroo encodes TCP traffic inside ordinary network protocol messages —
-primarily DNS queries and responses — making it appear as normal network
-activity to observers. The protocol stack:
+Nooshdaroo encodes TCP traffic inside DNS queries (TXT records) and responses,
+making it look like normal DNS resolution to network observers. The protocol stack:
 
 ```
 Application (browser, curl, etc.)
@@ -33,29 +55,13 @@ Nooshdaroo client (this binary)
     ↓ smux v2 (stream multiplexing)
     ↓ Noise_NK (authenticated encryption)
     ↓ KCP (reliable transport)
-    ↓ Carrier encoding (base32 QNAME, TXT/CNAME/NULL RDATA)
-Recursive resolver / network path
+    ↓ DNS queries (base32 in QNAME, data in TXT RDATA)
+Recursive DNS resolver (8.8.8.8, etc.)
     ↓
-Nooshdaroo server (authoritative endpoint)
+Nooshdaroo server (authoritative for tunnel domain)
     ↓ SOCKS5 (to destination)
 Internet
 ```
-
-### Multi-Record Type Support
-
-The tunnel carrier supports multiple record types to maximize throughput
-and evade filtering:
-
-| Record Type | Direction | Capacity | Notes |
-|-------------|-----------|----------|-------|
-| **TXT** | Downstream | ~900 bytes/response | Primary. Highest capacity per query. |
-| **CNAME** | Downstream | ~200 bytes/response | Fallback when TXT is filtered. |
-| **NULL** | Downstream | ~900 bytes/response | Raw binary, fewer resolvers support it. |
-| **AAAA** | Downstream | 16 bytes/response | Ultra-low profile, mimics IPv6 lookups. |
-| **Base32 QNAME** | Upstream | ~150 bytes/query | All upstream data encoded in query names. |
-
-The client automatically negotiates the best available record type based
-on what the resolver and network path support.
 
 ### Chrome Traffic Mimicry
 
@@ -116,23 +122,17 @@ The client starts a SOCKS5 proxy on `127.0.0.1:1080` (configurable with `-p`).
 
 ## Server — Built for Scale
 
-The server is designed to handle thousands of concurrent users on a single
-instance, with features for horizontal scaling across multiple IPs and processes:
+The server handles thousands of concurrent users on a single instance, with
+features for horizontal scaling:
 
 - **Multi-IP binding** (`listen_addrs`): Bind multiple public IPs on one instance.
-  Essential for anycast and multi-homed deployments.
-- **TCP + UDP listeners** (`tcp_listen_addrs`): Accept both UDP/53 and TCP/53
-  queries. TCP required for responses exceeding MTU.
+- **TCP + UDP listeners** (`tcp_listen_addrs`): Accept both UDP/53 and TCP/53.
 - **Multi-key rotation** (`extra_privkeys`): Accept multiple Noise keypairs
-  simultaneously. Enables zero-downtime key rotation — push a new key via OTA,
-  then retire the old one.
+  simultaneously for zero-downtime key rotation.
 - **Multi-domain** (`domains`): Serve multiple tunnel domains from one process.
-- **SO_REUSEPORT** (`reuseport`): Run multiple server processes on the same
-  port. Kernel distributes packets across workers for linear scaling.
-- **Egress IP rotation** (`egress_ips`): Rotate outbound connections across
-  multiple IPs to avoid per-IP rate limits on destination sites.
-- **Configurable limits**: `max_streams` (default 4096) and `idle_timeout_sec`
-  (default 120s) to tune resource usage per deployment.
+- **SO_REUSEPORT** (`reuseport`): Run multiple server processes on the same port.
+- **Egress IP rotation** (`egress_ips`): Rotate outbound connections across IPs.
+- **Configurable limits**: `max_streams` (default 4096) and `idle_timeout_sec` (default 120s).
 
 Example production server config:
 
@@ -166,7 +166,9 @@ Options:
       --pubkey <HEX>         Server public key (32 bytes hex)
       --resolver <IP>        Force a specific resolver
       --tunnels <N>          Parallel tunnels [default: 2]
-      --scan-resolvers       Scan for working resolvers
+      --scan-resolvers       Scan well-known resolvers for working ones
+      --scan-iran            Scan Iran IP ranges for resolvers (auto-detects ISP)
+      --scan-cidr <CIDR>     Scan a specific CIDR for resolvers (e.g. "5.160.0.0/16")
       --ota-refresh          Fetch OTA config update
       --ota-domain <DOMAIN>  OTA config domain
       --ota-nonce <NONCE>    OTA decryption nonce (12 chars)
@@ -271,19 +273,23 @@ implementation. You can use a Go dnstt-server with a Nooshdaroo client,
 or vice versa.
 
 **Protocol stack:**
-- **Carrier**: base32 encoding in QNAME labels (upstream), TXT/CNAME/NULL RDATA (downstream)
+- **Carrier**: base32 encoding in QNAME labels (upstream), TXT RDATA (downstream)
 - **KCP**: ARQ reliable transport over unreliable carrier
 - **Noise_NK**: `Noise_NK_25519_ChaChaPoly_BLAKE2s` authenticated encryption
 - **smux v2**: Stream multiplexing (multiple TCP connections over one tunnel)
 - **SOCKS5**: Server-side proxy for outbound connections
 
-### Roadmap
+### Iran Resolver Scanner
 
-- **ICMP carrier**: Encode tunnel data inside ICMP Echo payloads. Available on
-  desktop platforms where raw sockets are permitted. Useful when UDP/53 is
-  blocked but ICMP (ping) passes freely.
-- **HTTP carrier**: Encode data in HTTP request/response bodies via CDN front
-  domains. Provides a fallback when all other carriers are blocked.
+The client embeds CIDR ranges for 8 major Iranian ISPs (MCI, Irancell, TCI, DCI,
+Rightel, Shatel, ParsOnline, Asiatech). When `--scan-iran` is used:
+
+1. Detects local IP via UDP socket introspection
+2. Identifies the user's ISP from embedded CIDR→ASN mapping
+3. Scans user's /24 first (254 IPs, <1s)
+4. Expands to /16 with common resolver octets (.1, .2, .10, .100, .200)
+5. Falls back to 20+ pre-verified Iran resolver IPs
+6. Caches working resolvers in `~/.config/nooshdaroo/` for next run
 
 ## Security
 
@@ -291,6 +297,54 @@ or vice versa.
 - Server identity verified via pre-shared public key
 - No secrets compiled into the binary
 - Cover traffic reduces fingerprinting risk
+
+## Contributing
+
+Nooshdaroo is open source and we welcome contributions. Here are areas where
+help is especially valuable:
+
+### Wanted: Multi-Record Type Support
+
+Currently the tunnel uses **TXT records only** for downstream data. Adding
+alternative record types would improve resilience when TXT is filtered:
+
+| Record Type | Capacity | Why it helps |
+|-------------|----------|--------------|
+| **CNAME** | ~200 bytes/response | Looks like normal CDN traffic. Many networks that filter TXT leave CNAME alone. |
+| **NULL (type 10)** | ~900 bytes/response | Raw binary payload, same capacity as TXT. Less common so less likely to be filtered. |
+| **AAAA** | 16 bytes/response | Ultra-low profile — indistinguishable from IPv6 lookups. Low throughput but very stealthy. |
+| **MX** | ~200 bytes/response | Looks like email routing. Rarely filtered. |
+
+The client would negotiate record type with the server during the Noise handshake,
+then fall back through types until one works. Server changes needed in `dns.rs`,
+client changes in `dns_codec.rs`. See `server/src/dns.rs:568` for where TXT-only
+filtering currently happens.
+
+### Wanted: ICMP Carrier
+
+Encode tunnel data inside ICMP Echo (ping) payloads. Useful when UDP/53 is
+blocked but ICMP passes freely. Requires `CAP_NET_RAW` on Linux or root on macOS.
+Would be a new carrier module alongside the DNS carrier.
+
+### Wanted: DNS-over-HTTPS (DoH) Transport
+
+Use DoH (RFC 8484) as the carrier instead of raw UDP/53. This wraps tunnel queries
+inside HTTPS to well-known DoH providers (Cloudflare, Google), making them
+indistinguishable from normal encrypted DNS traffic.
+
+### Wanted: Load Balancer (dnstt-lb)
+
+A lightweight UDP proxy that sits between the network edge and multiple
+`nooshdaroo-server` workers. Extracts the 8-byte ClientID from the QNAME,
+uses rendezvous hashing for sticky routing, and rewrites DNS transaction IDs
+to avoid collisions. Enables horizontal scaling to 4–8x capacity per IP.
+
+### How to contribute
+
+1. Fork the repo
+2. Create a feature branch (`git checkout -b feature/cname-records`)
+3. Implement your changes with tests
+4. Submit a PR with a clear description
 
 ## License
 
