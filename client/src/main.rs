@@ -6,6 +6,7 @@ mod chrome_cover;
 mod config;
 mod dns_codec;
 mod iran_ranges;
+mod russia_ranges;
 mod tunnel;
 mod ui;
 
@@ -63,7 +64,11 @@ struct Args {
     #[arg(long)]
     scan_iran: bool,
 
-    /// Limit Iran scan to a specific CIDR (e.g. "5.160.100.0/24" or "5.160.0.0/16")
+    /// Scan Russia IP ranges for working resolvers (auto-detects your ISP)
+    #[arg(long)]
+    scan_russia: bool,
+
+    /// Limit scan to a specific CIDR (e.g. "5.160.100.0/24" or "5.160.0.0/16")
     #[arg(long, value_name = "CIDR")]
     scan_cidr: Option<String>,
 
@@ -195,39 +200,83 @@ async fn main() {
     // Build resolver list
     let resolvers = if let Some(ref r) = args.resolver {
         vec![r.clone()]
-    } else if args.scan_iran || args.scan_cidr.is_some() {
-        // Iran-specific resolver scan: detect local IP → scan ISP ranges
+    } else if args.scan_iran || args.scan_russia || args.scan_cidr.is_some() {
+        // Country-specific resolver scan: blazing fast adaptive single-socket scanner
         let probe_domain = domains.first()
             .map(|(d, _)| d.as_str())
             .unwrap_or("t.example.com");
 
-        let candidates = if let Some(ref cidr_str) = args.scan_cidr {
-            // User-specified CIDR range (e.g. "5.160.100.0/24")
+        let country = if args.scan_russia { "Russia" } else { "Iran" };
+
+        let candidates: Vec<std::net::Ipv4Addr> = if let Some(ref cidr_str) = args.scan_cidr {
             if !args.quiet {
                 ui::print_status("Scan", &format!("Scanning {} for resolvers...", cidr_str));
             }
-            parse_cidr_candidates(cidr_str, 10000)
+            parse_cidr_candidates(cidr_str, 65536)
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect()
         } else {
-            // Auto-detect local IP and generate smart candidate list
             let local_ip = iran_ranges::detect_local_ip();
             if !args.quiet {
                 if let Some(ip) = local_ip {
-                    let isp_name = iran_ranges::find_isp(ip)
-                        .map(|g| g.name)
-                        .unwrap_or("Unknown ISP");
-                    ui::print_status("Detected", &format!("{} ({})", ip, isp_name));
+                    if args.scan_russia {
+                        let isp_name = russia_ranges::find_isp(ip)
+                            .map(|g| g.name)
+                            .unwrap_or("Unknown ISP");
+                        ui::print_status("Detected", &format!("{} ({})", ip, isp_name));
+                        ui::print_dim(&format!(
+                            "  Russia IP space: {} ranges, {:.1}M IPs embedded",
+                            russia_ranges::russia_range_count(),
+                            russia_ranges::russia_ip_count() as f64 / 1e6,
+                        ));
+                    } else {
+                        let isp_name = iran_ranges::find_isp(ip)
+                            .map(|g| g.name)
+                            .unwrap_or("Unknown ISP");
+                        ui::print_status("Detected", &format!("{} ({})", ip, isp_name));
+                        if iran_ranges::is_iran_ip(ip) {
+                            ui::print_dim(&format!(
+                                "  Iran IP space: {} ranges, {:.1}M IPs embedded",
+                                iran_ranges::iran_range_count(),
+                                iran_ranges::iran_ip_count() as f64 / 1e6,
+                            ));
+                        }
+                    }
                 } else {
-                    ui::print_status("Scan", "Could not detect local IP, scanning all Iran ranges");
+                    ui::print_status("Scan", &format!(
+                        "Could not detect local IP, scanning all {} ranges", country
+                    ));
                 }
             }
-            let ips = iran_ranges::generate_scan_candidates(local_ip, 5000);
-            if !args.quiet {
-                ui::print_status("Scan", &format!("Probing {} candidate resolvers...", ips.len()));
+            if args.scan_russia {
+                russia_ranges::generate_scan_candidates(local_ip, 10000)
+            } else {
+                iran_ranges::generate_scan_candidates(local_ip, 10000)
             }
-            ips.iter().map(|ip| ip.to_string()).collect()
         };
 
-        let results = tunnel::scan_resolvers(&candidates, probe_domain, 4000).await;
+        if !args.quiet {
+            ui::print_status("Scan", &format!(
+                "Probing {} seed candidates (adaptive single-socket scanner)...",
+                candidates.len()
+            ));
+        }
+
+        let quiet_for_cb = args.quiet;
+        let progress: Option<Box<dyn Fn(&str) + Send>> = if !quiet_for_cb {
+            Some(Box::new(move |msg: &str| {
+                ui::print_dim(&format!("  {}", msg));
+            }))
+        } else {
+            None
+        };
+
+        let results = iran_ranges::scan_adaptive(
+            &candidates,
+            Some(probe_domain),
+            progress,
+        ).await;
 
         if results.is_empty() {
             ui::print_error("No working resolvers found in scan range.");
@@ -236,16 +285,29 @@ async fn main() {
             std::process::exit(1);
         }
 
+        // Show results: tunnel-capable first, then generic resolvers
+        let tunnel_capable: Vec<_> = results.iter().filter(|r| r.is_tunnel_capable).collect();
+        let generic: Vec<_> = results.iter().filter(|r| !r.is_tunnel_capable).collect();
+
         if !args.quiet {
             ui::print_status("Found", &format!(
-                "{} working resolvers (scanned {})", results.len(), candidates.len()
+                "{} resolvers ({} tunnel-capable) from {} scanned",
+                results.len(), tunnel_capable.len(), candidates.len()
             ));
-            for (ip, ms) in results.iter().take(10) {
-                ui::print_dim(&format!("  {} ({}ms)", ip, ms));
+            for r in tunnel_capable.iter().take(5) {
+                ui::print_dim(&format!("  {} ({}ms) ★ tunnel verified", r.ip, r.latency_ms));
+            }
+            for r in generic.iter().take(5) {
+                ui::print_dim(&format!("  {} ({}ms)", r.ip, r.latency_ms));
             }
         }
 
-        let working: Vec<String> = results.iter().map(|(ip, _)| ip.clone()).collect();
+        // Prefer tunnel-capable resolvers, fall back to generic
+        let working: Vec<String> = if !tunnel_capable.is_empty() {
+            tunnel_capable.iter().map(|r| r.ip.to_string()).collect()
+        } else {
+            results.iter().map(|r| r.ip.to_string()).collect()
+        };
         save_resolver_cache(&working);
         working
     } else if args.scan_resolvers {
