@@ -315,7 +315,8 @@ pub async fn start_cover_traffic(
             let mut schedule: Vec<(u64, bool)> = Vec::new();
             let mut elapsed = 0u64;
             while elapsed < wait {
-                let chunk = rng.gen_range(3..bg_wait.min(wait - elapsed + 1));
+                let upper = bg_wait.min(wait - elapsed + 1).max(4);
+                let chunk = rng.gen_range(3..upper);
                 let do_bg = rng.gen_bool(0.3);
                 schedule.push((chunk, do_bg));
                 elapsed += chunk;

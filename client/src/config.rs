@@ -87,6 +87,16 @@ impl Config {
         all[rand::random::<usize>() % all.len()].clone()
     }
 
+    /// Get OTA domain from config (e.g. embedded defaults).
+    pub fn ota_domain(&self) -> Option<String> {
+        self.raw["ota"]["domain"].as_str().map(|s| s.to_string())
+    }
+
+    /// Get OTA nonce from config (e.g. embedded defaults).
+    pub fn ota_nonce(&self) -> Option<String> {
+        self.raw["ota"]["nonce"].as_str().map(|s| s.to_string())
+    }
+
     /// Get OTA-pushed cover domains for Chrome DNS mimicry.
     /// Falls back to empty if no OTA data (chrome_cover.rs has hardcoded fallbacks).
     pub fn cover_domains(&self) -> Vec<String> {
@@ -133,7 +143,44 @@ pub fn load_config_file(path: &str) -> Result<Config, String> {
     Ok(Config::from_json(raw))
 }
 
-/// Load configuration: from file if provided, otherwise empty.
+/// Built-in default configuration.
+/// This allows the binary to work out-of-the-box with zero arguments.
+/// Operators deploying their own infrastructure should override with --config.
+/// OTA updates will automatically refresh this with the latest server list.
+const DEFAULT_CONFIG: &str = r#"{
+  "transport": {
+    "dnstt": {
+      "domains": [
+        { "domain": "t.cdn.cdn-relay-eu.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.cdn-proxy-edge.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.static-cdn-proxy.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.edge-cache-proxy.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.cdnproxy-eu.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.copper-fern-studio.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.silver-birch-labs.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.golden-maple-works.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.iron-pine-craft.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" },
+        { "domain": "t.cdn.bright-elm-studio.com", "pubkey": "5999f891e49ffe4e1e689feab2156a431b6ecc2a61c701ffb58683353b4e744f" }
+      ],
+      "udp_resolvers": [
+        "8.8.8.8", "8.8.4.4",
+        "1.1.1.1", "1.0.0.1",
+        "9.9.9.9", "149.112.112.112",
+        "208.67.222.222", "208.67.220.220"
+      ]
+    }
+  },
+  "ota": {
+    "domain": "_cfg.nooshdaroo.cdn.cdncache-eu.net",
+    "nonce": "rostam-dns-a"
+  },
+  "cover_domains": [
+    "www.google.com", "www.youtube.com", "www.wikipedia.org",
+    "www.instagram.com", "www.twitter.com"
+  ]
+}"#;
+
+/// Load configuration: from file if provided, otherwise use built-in defaults.
 pub fn load_config(path: Option<&str>) -> Config {
     match path {
         Some(p) => match load_config_file(p) {
@@ -143,7 +190,12 @@ pub fn load_config(path: Option<&str>) -> Config {
                 std::process::exit(1);
             }
         },
-        None => Config::empty(),
+        None => {
+            // Use embedded default config so the binary works with zero arguments
+            let raw: Value = serde_json::from_str(DEFAULT_CONFIG)
+                .expect("built-in config is valid JSON");
+            Config::from_json(raw)
+        }
     }
 }
 

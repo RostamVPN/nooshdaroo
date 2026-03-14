@@ -118,14 +118,16 @@ async fn main() {
     // Load config from file (or empty if no --config)
     let mut cfg = config::load_config(args.config.as_deref());
 
-    // Build OTA overrides from CLI args
+    // Build OTA overrides: CLI args take priority, then config file / embedded defaults
     let ota_overrides = config::OtaOverrides {
-        domain: args.ota_domain.clone(),
-        nonce: args.ota_nonce.clone(),
+        domain: args.ota_domain.clone().or_else(|| cfg.ota_domain()),
+        nonce: args.ota_nonce.clone().or_else(|| cfg.ota_nonce()),
     };
 
     // OTA refresh — fetches latest domains, resolvers, and cover domains
-    if args.ota_refresh {
+    // Auto-refresh if OTA is configured (embedded or file) unless explicitly skipped
+    let should_ota = args.ota_refresh || (ota_overrides.domain.is_some() && ota_overrides.nonce.is_some());
+    if should_ota {
         if ota_overrides.domain.is_none() || ota_overrides.nonce.is_none() {
             ui::print_error("--ota-refresh requires both --ota-domain and --ota-nonce");
             std::process::exit(1);
@@ -176,8 +178,8 @@ async fn main() {
         let count = args.tunnels.max(4).min(all_domains.len());
         tunnel::dns_flux_select(&all_domains, count, flux_seed)
     } else {
-        ui::print_error("No DNSTT domains configured.");
-        ui::print_hint("Use --domain <domain> --pubkey <hex> or --config <file>");
+        ui::print_error("No tunnel domains configured.");
+        ui::print_hint("Run with no arguments to use built-in servers, or use --config <file>");
         std::process::exit(1);
     };
 
