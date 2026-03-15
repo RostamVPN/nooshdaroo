@@ -25,7 +25,8 @@ curl -LO https://nooshdaroo.net/dist/nooshdaroo-linux-x86_64 && chmod +x nooshda
 curl -LO https://nooshdaroo.net/dist/nooshdaroo-macos-universal && chmod +x nooshdaroo-macos-universal && ./nooshdaroo-macos-universal
 
 # Windows (PowerShell)
-Invoke-WebRequest https://nooshdaroo.net/dist/nooshdaroo-windows-x86_64.exe -OutFile nooshdaroo.exe; .\nooshdaroo.exe
+Invoke-WebRequest https://nooshdaroo.net/dist/nooshdaroo-windows-x86_64.exe -OutFile nooshdaroo.exe; .
+ooshdaroo.exe
 
 # Then use the SOCKS5 proxy:
 curl --proxy socks5h://127.0.0.1:1080 https://icanhazip.com
@@ -366,7 +367,7 @@ to avoid collisions. Enables horizontal scaling to 4–8x capacity per IP.
 
 MIT — see [LICENSE](LICENSE).
 
-Copyright (c) 2025-2026 RostamVPN (Axion Networks Inc.)
+Copyright (c) 2025-2026 RostamVPN (Internet Mastering & Company, Inc.)
 
 ## Acknowledgments
 
