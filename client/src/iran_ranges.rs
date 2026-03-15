@@ -235,6 +235,86 @@ static NIN_RESOLVER_SUBNETS: &[(u8, u8)] = &[
     (50, 1),
 ];
 
+/// Calculate total IP addresses in an ISP group's ranges.
+pub fn isp_ip_count(group: &IspGroup) -> u64 {
+    group.ranges.iter().map(|c| c.size() as u64).sum()
+}
+
+/// Find an ISP group by name (case-insensitive) or ASN number.
+pub fn find_isp_by_name_or_asn(query: &str) -> Option<&'static IspGroup> {
+    // Try ASN number first
+    if let Ok(asn) = query.parse::<u32>() {
+        return ISP_GROUPS.iter().find(|g| g.asn == asn);
+    }
+    // Also try stripping "AS" prefix
+    if let Some(stripped) = query.strip_prefix("AS").or_else(|| query.strip_prefix("as")) {
+        if let Ok(asn) = stripped.parse::<u32>() {
+            return ISP_GROUPS.iter().find(|g| g.asn == asn);
+        }
+    }
+    // Case-insensitive name match
+    let lower = query.to_lowercase();
+    ISP_GROUPS.iter().find(|g| g.name.to_lowercase() == lower)
+}
+
+/// Generate scan candidates for a specific ISP group only.
+pub fn generate_isp_candidates(group: &IspGroup, max_candidates: usize) -> Vec<Ipv4Addr> {
+    let mut candidates = Vec::with_capacity(max_candidates);
+    let mut seen = std::collections::HashSet::with_capacity(max_candidates);
+
+    // First: any verified resolvers that fall within this ISP's ranges
+    for &r in IRAN_VERIFIED_RESOLVERS {
+        if let Ok(ip) = r.parse::<Ipv4Addr>() {
+            let ip_u32 = u32::from(ip);
+            if group.ranges.iter().any(|c| c.contains(ip_u32)) {
+                if candidates.len() < max_candidates && seen.insert(ip) {
+                    candidates.push(ip);
+                }
+            }
+        }
+    }
+
+    // Then: common resolver patterns across all ISP CIDRs
+    let common: &[u8] = &[1, 2, 10, 11, 20, 100, 200, 254];
+    for cidr in group.ranges {
+        let bo = Ipv4Addr::from(cidr.base).octets();
+        // Scan common resolver octets in each /16 within this CIDR
+        let prefix = cidr.prefix_len;
+        if prefix <= 16 {
+            // Large block: scan common octets in first few /24s
+            for third in 0..=255u8 {
+                for &last in common {
+                    let ip = Ipv4Addr::new(bo[0], bo[1], third, last);
+                    if candidates.len() >= max_candidates { return candidates; }
+                    if seen.insert(ip) { candidates.push(ip); }
+                }
+            }
+        } else if prefix <= 24 {
+            // /17-/24: scan within the block
+            let block_size = 1u32 << (32 - prefix);
+            let base = cidr.base;
+            for offset in (0..block_size).step_by(256) {
+                let subnet_base = base + offset;
+                let bo2 = Ipv4Addr::from(subnet_base).octets();
+                for &last in common {
+                    let ip = Ipv4Addr::new(bo2[0], bo2[1], bo2[2], last);
+                    if candidates.len() >= max_candidates { return candidates; }
+                    if seen.insert(ip) { candidates.push(ip); }
+                }
+            }
+        } else {
+            // /25+: just scan every IP
+            for i in 1..cidr.size().saturating_sub(1) {
+                let ip = cidr.nth(i);
+                if candidates.len() >= max_candidates { return candidates; }
+                if seen.insert(ip) { candidates.push(ip); }
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Find which ISP an IP belongs to.
 pub fn find_isp(ip: Ipv4Addr) -> Option<&'static IspGroup> {
     let ip_u32 = u32::from(ip);

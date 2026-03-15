@@ -141,6 +141,76 @@ pub static RUSSIA_VERIFIED_RESOLVERS: &[&str] = &[
     "193.58.251.251",                // SkyDNS
 ];
 
+/// Calculate total IP addresses in an ISP group's ranges.
+pub fn isp_ip_count(group: &IspGroup) -> u64 {
+    group.ranges.iter().map(|c| c.size() as u64).sum()
+}
+
+/// Find an ISP group by name (case-insensitive) or ASN number.
+pub fn find_isp_by_name_or_asn(query: &str) -> Option<&'static IspGroup> {
+    if let Ok(asn) = query.parse::<u32>() {
+        return ISP_GROUPS.iter().find(|g| g.asn == asn);
+    }
+    if let Some(stripped) = query.strip_prefix("AS").or_else(|| query.strip_prefix("as")) {
+        if let Ok(asn) = stripped.parse::<u32>() {
+            return ISP_GROUPS.iter().find(|g| g.asn == asn);
+        }
+    }
+    let lower = query.to_lowercase();
+    ISP_GROUPS.iter().find(|g| g.name.to_lowercase() == lower)
+}
+
+/// Generate scan candidates for a specific ISP group only.
+pub fn generate_isp_candidates(group: &IspGroup, max_candidates: usize) -> Vec<Ipv4Addr> {
+    use crate::iran_ranges::Cidr;
+    let mut candidates = Vec::with_capacity(max_candidates);
+    let mut seen = std::collections::HashSet::with_capacity(max_candidates);
+
+    // Verified resolvers within this ISP's ranges
+    for &r in RUSSIA_VERIFIED_RESOLVERS {
+        if let Ok(ip) = r.parse::<Ipv4Addr>() {
+            let ip_u32 = u32::from(ip);
+            if group.ranges.iter().any(|c| c.contains(ip_u32)) {
+                if candidates.len() < max_candidates && seen.insert(ip) {
+                    candidates.push(ip);
+                }
+            }
+        }
+    }
+
+    let common: &[u8] = &[1, 2, 10, 11, 20, 100, 200, 254];
+    for cidr in group.ranges {
+        let bo = Ipv4Addr::from(cidr.base).octets();
+        if cidr.prefix_len <= 16 {
+            for third in 0..=255u8 {
+                for &last in common {
+                    let ip = Ipv4Addr::new(bo[0], bo[1], third, last);
+                    if candidates.len() >= max_candidates { return candidates; }
+                    if seen.insert(ip) { candidates.push(ip); }
+                }
+            }
+        } else if cidr.prefix_len <= 24 {
+            let block_size = 1u32 << (32 - cidr.prefix_len);
+            for offset in (0..block_size).step_by(256) {
+                let bo2 = Ipv4Addr::from(cidr.base + offset).octets();
+                for &last in common {
+                    let ip = Ipv4Addr::new(bo2[0], bo2[1], bo2[2], last);
+                    if candidates.len() >= max_candidates { return candidates; }
+                    if seen.insert(ip) { candidates.push(ip); }
+                }
+            }
+        } else {
+            for i in 1..cidr.size().saturating_sub(1) {
+                let ip = cidr.nth(i);
+                if candidates.len() >= max_candidates { return candidates; }
+                if seen.insert(ip) { candidates.push(ip); }
+            }
+        }
+    }
+
+    candidates
+}
+
 pub fn find_isp(ip: Ipv4Addr) -> Option<&'static IspGroup> {
     let ip_u32 = u32::from(ip);
     for group in ISP_GROUPS {

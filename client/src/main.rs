@@ -26,7 +26,10 @@ const CACHE_FILE: &str = ".nooshdaroo-cache.json";
         nooshdaroo -p 9050                                 Listen on port 9050\n  \
         nooshdaroo --scan-resolvers                        Find working DNS resolvers\n  \
         nooshdaroo --resolver 8.8.8.8                      Use Google DNS as resolver\n  \
-        nooshdaroo --tunnels 4                             Open 4 parallel tunnels\n\n\
+        nooshdaroo --tunnels 4                             Open 4 parallel tunnels\n  \
+        nooshdaroo --list-isps                             Show all known ISPs\n  \
+        nooshdaroo --scan-isp MCI                          Scan only MCI ranges\n  \
+        nooshdaroo --scan-isp AS44244                      Scan by ASN number\n\n\
         BROWSER SETUP:\n  \
         Firefox:  Settings > Network > Manual Proxy > SOCKS Host: 127.0.0.1  Port: 1080\n  \
         Chrome:   chrome --proxy-server=\"socks5://127.0.0.1:1080\"\n  \
@@ -53,8 +56,8 @@ struct Args {
     #[arg(long, value_name = "IP")]
     resolver: Option<String>,
 
-    /// Number of parallel tunnels (default: 2)
-    #[arg(long, default_value = "2", value_name = "N")]
+    /// Number of parallel tunnels (default: 8)
+    #[arg(long, default_value = "8", value_name = "N")]
     tunnels: usize,
 
     /// Scan for working DNS resolvers before connecting
@@ -72,6 +75,14 @@ struct Args {
     /// Limit scan to a specific CIDR (e.g. "5.160.100.0/24" or "5.160.0.0/16")
     #[arg(long, value_name = "CIDR")]
     scan_cidr: Option<String>,
+
+    /// List all known ISPs with ASN numbers and IP ranges, then exit
+    #[arg(long)]
+    list_isps: bool,
+
+    /// Scan only a specific ISP's ranges (by name or ASN, e.g. "MCI" or "197207" or "AS44244")
+    #[arg(long, value_name = "ISP")]
+    scan_isp: Option<String>,
 
     /// Fetch fresh config from OTA before connecting
     #[arg(long)]
@@ -128,6 +139,12 @@ async fn main() {
     // Print banner
     if !args.quiet {
         ui::print_banner();
+    }
+
+    // --list-isps: show all ISP groups and exit
+    if args.list_isps {
+        print_isp_table();
+        return;
     }
 
     // Load config from file (or empty if no --config)
@@ -201,7 +218,7 @@ async fn main() {
     // Build resolver list
     let resolvers = if let Some(ref r) = args.resolver {
         vec![r.clone()]
-    } else if args.scan_iran || args.scan_russia || args.scan_cidr.is_some() {
+    } else if args.scan_isp.is_some() || args.scan_iran || args.scan_russia || args.scan_cidr.is_some() {
         // Country-specific resolver scan: blazing fast adaptive single-socket scanner
         let probe_domain = domains.first()
             .map(|(d, _)| d.as_str())
@@ -209,7 +226,27 @@ async fn main() {
 
         let country = if args.scan_russia { "Russia" } else { "Iran" };
 
-        let candidates: Vec<std::net::Ipv4Addr> = if let Some(ref cidr_str) = args.scan_cidr {
+        let candidates: Vec<std::net::Ipv4Addr> = if let Some(ref isp_query) = args.scan_isp {
+            // --scan-isp: targeted ISP scan
+            // Try Iran ISPs first, then Russia
+            let (isp_name, isp_asn, cands) =
+                if let Some(group) = iran_ranges::find_isp_by_name_or_asn(isp_query) {
+                    let c = iran_ranges::generate_isp_candidates(group, 10000);
+                    (group.name, group.asn, c)
+                } else if let Some(group) = russia_ranges::find_isp_by_name_or_asn(isp_query) {
+                    let c = russia_ranges::generate_isp_candidates(group, 10000);
+                    (group.name, group.asn, c)
+                } else {
+                    ui::print_error(&format!("Unknown ISP: \"{}\"", isp_query));
+                    ui::print_hint("Use --list-isps to see available ISPs");
+                    std::process::exit(1);
+                };
+            if !args.quiet {
+                ui::print_status("ISP", &format!("{} (AS{})", isp_name, isp_asn));
+                ui::print_dim(&format!("  {} scan candidates generated", cands.len()));
+            }
+            cands
+        } else if let Some(ref cidr_str) = args.scan_cidr {
             if !args.quiet {
                 ui::print_status("Scan", &format!("Scanning {} for resolvers...", cidr_str));
             }
@@ -226,29 +263,27 @@ async fn main() {
                             .map(|g| g.name)
                             .unwrap_or("Unknown ISP");
                         ui::print_status("Detected", &format!("{} ({})", ip, isp_name));
-                        ui::print_dim(&format!(
-                            "  Russia IP space: {} ranges, {:.1}M IPs embedded",
-                            russia_ranges::russia_range_count(),
-                            russia_ranges::russia_ip_count() as f64 / 1e6,
-                        ));
+                        print_isp_breakdown_russia();
                     } else {
                         let isp_name = iran_ranges::find_isp(ip)
                             .map(|g| g.name)
                             .unwrap_or("Unknown ISP");
                         ui::print_status("Detected", &format!("{} ({})", ip, isp_name));
                         if iran_ranges::is_iran_ip(ip) {
-                            ui::print_dim(&format!(
-                                "  Iran IP space: {} ranges, {:.1}M IPs embedded",
-                                iran_ranges::iran_range_count(),
-                                iran_ranges::iran_ip_count() as f64 / 1e6,
-                            ));
+                            print_isp_breakdown_iran();
                         }
                     }
                 } else {
                     ui::print_status("Scan", &format!(
                         "Could not detect local IP, scanning all {} ranges", country
                     ));
+                    if args.scan_russia {
+                        print_isp_breakdown_russia();
+                    } else {
+                        print_isp_breakdown_iran();
+                    }
                 }
+                ui::print_hint("  Tip: scan a specific ISP with --scan-isp <name|ASN>");
             }
             if args.scan_russia {
                 russia_ranges::generate_scan_candidates(local_ip, 10000)
@@ -534,6 +569,91 @@ fn cache_file_path() -> String {
     } else {
         CACHE_FILE.to_string()
     }
+}
+
+/// Print ISP breakdown table for Iran.
+fn print_isp_breakdown_iran() {
+    ui::print_dim(&format!(
+        "  Iran IP space: {} ranges, {:.1}M IPs",
+        iran_ranges::iran_range_count(),
+        iran_ranges::iran_ip_count() as f64 / 1e6,
+    ));
+    eprintln!();
+    ui::print_dim("  ISP                ASN        Ranges   IPs");
+    ui::print_dim("  ─────────────────  ─────────  ──────   ──────────");
+    for group in iran_ranges::ISP_GROUPS {
+        let ip_count = iran_ranges::isp_ip_count(group);
+        ui::print_dim(&format!(
+            "  {:<19} AS{:<7}  {:>4}     {:.1}M",
+            group.name, group.asn, group.ranges.len(),
+            ip_count as f64 / 1e6,
+        ));
+    }
+    eprintln!();
+}
+
+/// Print ISP breakdown table for Russia.
+fn print_isp_breakdown_russia() {
+    ui::print_dim(&format!(
+        "  Russia IP space: {} ranges, {:.1}M IPs",
+        russia_ranges::russia_range_count(),
+        russia_ranges::russia_ip_count() as f64 / 1e6,
+    ));
+    eprintln!();
+    ui::print_dim("  ISP                ASN        Ranges   IPs");
+    ui::print_dim("  ─────────────────  ─────────  ──────   ──────────");
+    for group in russia_ranges::ISP_GROUPS {
+        let ip_count = russia_ranges::isp_ip_count(group);
+        ui::print_dim(&format!(
+            "  {:<19} AS{:<7}  {:>4}     {:.1}M",
+            group.name, group.asn, group.ranges.len(),
+            ip_count as f64 / 1e6,
+        ));
+    }
+    eprintln!();
+}
+
+/// Print full ISP table for --list-isps and exit.
+fn print_isp_table() {
+    eprintln!("  \x1b[1mIran ISPs\x1b[0m");
+    eprintln!();
+    eprintln!("  {:<19} {:<12} {:>6}   {:>10}", "ISP", "ASN", "Ranges", "IPs");
+    eprintln!("  {}", "─".repeat(55));
+    for group in iran_ranges::ISP_GROUPS {
+        let ip_count = iran_ranges::isp_ip_count(group);
+        let ip_str = if ip_count >= 1_000_000 {
+            format!("{:.1}M", ip_count as f64 / 1e6)
+        } else {
+            format!("{:.0}K", ip_count as f64 / 1e3)
+        };
+        eprintln!(
+            "  {:<19} AS{:<9} {:>4}     {:>8}",
+            group.name, group.asn, group.ranges.len(), ip_str,
+        );
+    }
+
+    eprintln!();
+    eprintln!("  \x1b[1mRussia ISPs\x1b[0m");
+    eprintln!();
+    eprintln!("  {:<19} {:<12} {:>6}   {:>10}", "ISP", "ASN", "Ranges", "IPs");
+    eprintln!("  {}", "─".repeat(55));
+    for group in russia_ranges::ISP_GROUPS {
+        let ip_count = russia_ranges::isp_ip_count(group);
+        let ip_str = if ip_count >= 1_000_000 {
+            format!("{:.1}M", ip_count as f64 / 1e6)
+        } else {
+            format!("{:.0}K", ip_count as f64 / 1e3)
+        };
+        eprintln!(
+            "  {:<19} AS{:<9} {:>4}     {:>8}",
+            group.name, group.asn, group.ranges.len(), ip_str,
+        );
+    }
+
+    eprintln!();
+    eprintln!("  \x1b[2mScan a specific ISP: nooshdaroo --scan-isp MCI\x1b[0m");
+    eprintln!("  \x1b[2mScan by ASN:         nooshdaroo --scan-isp 197207\x1b[0m");
+    eprintln!("  \x1b[2mScan by ASN prefix:  nooshdaroo --scan-isp AS44244\x1b[0m");
 }
 
 /// Parse a CIDR string (e.g. "5.160.100.0/24") and generate all host IPs.
