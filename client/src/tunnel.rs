@@ -22,6 +22,7 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::dns_codec;
+use crate::doh;
 
 // ─── Protocol constants (must match dnstt-server exactly) ─────
 
@@ -492,6 +493,284 @@ impl DnsttTunnel {
             next_sid: AtomicU32::new(1),
         })
     }
+
+    /// Connect via DNS-over-HTTPS instead of raw UDP.
+    ///
+    /// The protocol stack is identical (KCP -> Noise -> smux), but DNS queries
+    /// are sent as HTTPS POST requests instead of UDP packets. Responses come
+    /// back synchronously in the HTTP response body.
+    async fn connect_doh(
+        &self,
+        doh_transport: Arc<doh::DohTransport>,
+        running: Arc<AtomicBool>,
+    ) -> Result<Smux2Session, String> {
+        let mtu = calc_send_mtu(&self.domain);
+        log::debug!("[dnstt:doh] Domain {} -> KCP MTU={}", self.domain, mtu);
+
+        // Channels — same as UDP path
+        let (kcp_input_tx, mut kcp_input_rx) = mpsc::channel::<Vec<u8>>(256);
+        let (smux_frame_tx, mut smux_frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let streams: Arc<std::sync::Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+        // No UDP recv loop needed — DoH responses come back in the HTTP response.
+        // No SRTT priming needed — HTTPS handles retransmission.
+
+        // Helper: send a DNS query via DoH and feed decoded packets into kcp_input_tx
+        async fn doh_send_and_feed(
+            doh: &doh::DohTransport,
+            dns_wire: &[u8],
+            kcp_input_tx: &mpsc::Sender<Vec<u8>>,
+        ) {
+            match doh.send_query(dns_wire).await {
+                Ok(response) => {
+                    if let Some(packets) = dns_codec::decode_response(&response) {
+                        for pkt in packets {
+                            if !pkt.is_empty() {
+                                let _ = kcp_input_tx.send(pkt).await;
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::debug!("[doh] query failed: {}", e),
+            }
+        }
+
+        // Helper: flush KCP output segments via DoH (spawns async tasks)
+        fn flush_kcp_via_doh(
+            kcp_bundle: &KcpBundle,
+            client_id: &[u8; 8],
+            domain: &str,
+            doh: &Arc<doh::DohTransport>,
+            kcp_input_tx: &mpsc::Sender<Vec<u8>>,
+        ) {
+            let segments = kcp_bundle.take_segments();
+            for seg in segments {
+                let q = dns_codec::encode_query(client_id, &seg, domain, false);
+                let doh_clone = doh.clone();
+                let tx = kcp_input_tx.clone();
+                tokio::spawn(async move {
+                    doh_send_and_feed(&doh_clone, &q, &tx).await;
+                });
+            }
+        }
+
+        // Noise NK handshake
+        let mut kcp_bundle = KcpBundle::new(mtu);
+        let client_id = self.client_id;
+        let domain = self.domain.clone();
+
+        let mut noise_hs = snow::Builder::new(NOISE_PATTERN.parse().unwrap())
+            .prologue(NOISE_PROLOGUE)
+            .remote_public_key(&self.server_pubkey)
+            .build_initiator()
+            .map_err(|e| format!("noise init: {}", e))?;
+
+        // -> e, es
+        let mut msg1 = vec![0u8; 96];
+        let len1 = noise_hs
+            .write_message(&[], &mut msg1)
+            .map_err(|e| format!("noise msg1: {}", e))?;
+        msg1.truncate(len1);
+
+        let mut framed = Vec::with_capacity(2 + len1);
+        framed.extend_from_slice(&(len1 as u16).to_be_bytes());
+        framed.extend_from_slice(&msg1);
+        kcp_bundle.send(&framed);
+
+        let now_ms = get_now_ms();
+        kcp_bundle.update(now_ms);
+        flush_kcp_via_doh(&kcp_bundle, &client_id, &domain, &doh_transport, &kcp_input_tx);
+
+        // Send initial poll via DoH
+        {
+            let poll_q = dns_codec::encode_query(&client_id, &[], &domain, true);
+            let doh_clone = doh_transport.clone();
+            let tx = kcp_input_tx.clone();
+            tokio::spawn(async move {
+                doh_send_and_feed(&doh_clone, &poll_q, &tx).await;
+            });
+        }
+
+        // <- e, ee — wait for handshake response
+        let mut stream_buf = Vec::new();
+        let mut tmp = vec![0u8; 65536];
+        let hs_start = Instant::now();
+        let mut hs_polls = 0u32;
+        let msg2_data = loop {
+            if hs_start.elapsed() > NOISE_HANDSHAKE_TIMEOUT {
+                return Err(format!(
+                    "Noise handshake timeout ({}s) via DoH",
+                    hs_start.elapsed().as_secs()
+                ));
+            }
+
+            // Drain input channel
+            loop {
+                match kcp_input_rx.try_recv() {
+                    Ok(pkt) => kcp_bundle.input(&pkt),
+                    Err(_) => break,
+                }
+            }
+
+            let now_ms = get_now_ms();
+            kcp_bundle.update(now_ms);
+            flush_kcp_via_doh(&kcp_bundle, &client_id, &domain, &doh_transport, &kcp_input_tx);
+
+            loop {
+                match kcp_bundle.recv(&mut tmp) {
+                    Some(n) if n > 0 => stream_buf.extend_from_slice(&tmp[..n]),
+                    _ => break,
+                }
+            }
+
+            if stream_buf.len() >= 2 {
+                let frame_len = u16::from_be_bytes([stream_buf[0], stream_buf[1]]) as usize;
+                if frame_len > 0 && stream_buf.len() >= 2 + frame_len {
+                    break stream_buf[2..2 + frame_len].to_vec();
+                }
+            }
+
+            hs_polls += 1;
+            if hs_polls % 5 == 0 {
+                let poll_q = dns_codec::encode_query(&client_id, &[], &domain, true);
+                let doh_clone = doh_transport.clone();
+                let tx = kcp_input_tx.clone();
+                tokio::spawn(async move {
+                    doh_send_and_feed(&doh_clone, &poll_q, &tx).await;
+                });
+            }
+
+            tokio::select! {
+                Some(pkt) = kcp_input_rx.recv() => { kcp_bundle.input(&pkt); }
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        };
+
+        let handshake_consumed = 2 + msg2_data.len();
+        let leftover = if stream_buf.len() > handshake_consumed {
+            stream_buf[handshake_consumed..].to_vec()
+        } else {
+            Vec::new()
+        };
+
+        let mut payload_buf = [0u8; 128];
+        noise_hs
+            .read_message(&msg2_data, &mut payload_buf)
+            .map_err(|e| format!("noise msg2: {}", e))?;
+        let transport = noise_hs
+            .into_transport_mode()
+            .map_err(|e| format!("noise transport: {}", e))?;
+        let mut noise = NoiseTransport { state: transport };
+        log::info!("[dnstt:doh] Noise handshake complete");
+
+        // KCP owner task — same logic as UDP but sends via DoH
+        {
+            let doh = doh_transport.clone();
+            let streams = streams.clone();
+            let running = running.clone();
+            let client_id = self.client_id;
+            let domain = self.domain.clone();
+            tokio::spawn(async move {
+                let mut stream_buf = leftover;
+                let mut smux_buf: Vec<u8> = Vec::new();
+                let mut poll_delay = INIT_POLL_DELAY;
+                let mut polls_without_data: usize = 0;
+                let mut kcp_ticker =
+                    tokio::time::interval(Duration::from_millis(KCP_INTERVAL as u64));
+                kcp_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let poll_sleep = tokio::time::sleep(poll_delay);
+                tokio::pin!(poll_sleep);
+
+                loop {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    tokio::select! {
+                        Some(pkt) = kcp_input_rx.recv() => {
+                            kcp_bundle.input(&pkt);
+                            loop {
+                                match kcp_input_rx.try_recv() {
+                                    Ok(p) => { kcp_bundle.input(&p); }
+                                    Err(_) => break,
+                                }
+                            }
+                            poll_delay = INIT_POLL_DELAY;
+                            polls_without_data = 0;
+                            poll_sleep.as_mut().reset(tokio::time::Instant::now() + poll_delay);
+                        }
+                        Some(frame) = smux_frame_rx.recv() => {
+                            match noise.encrypt(&frame) {
+                                Ok(encrypted) => { kcp_bundle.send(&encrypted); }
+                                Err(e) => { log::error!("[dnstt:doh] Noise encrypt failed: {}", e); break; }
+                            }
+                            loop {
+                                match smux_frame_rx.try_recv() {
+                                    Ok(f) => {
+                                        if let Ok(enc) = noise.encrypt(&f) {
+                                            kcp_bundle.send(&enc);
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            poll_delay = INIT_POLL_DELAY;
+                            polls_without_data = 0;
+                            poll_sleep.as_mut().reset(tokio::time::Instant::now() + poll_delay);
+                        }
+                        _ = kcp_ticker.tick() => {}
+                        _ = &mut poll_sleep => {
+                            // Poll query via DoH
+                            let q = dns_codec::encode_query(&client_id, &[], &domain, true);
+                            let doh_clone = doh.clone();
+                            let tx = kcp_input_tx.clone();
+                            tokio::spawn(async move {
+                                doh_send_and_feed(&doh_clone, &q, &tx).await;
+                            });
+                            polls_without_data += 1;
+                            if polls_without_data >= POLL_LIMIT {
+                                poll_delay = MAX_POLL_DELAY;
+                            } else {
+                                poll_delay = Duration::from_millis(
+                                    (poll_delay.as_millis() as f64 * POLL_DELAY_MULTIPLIER) as u64
+                                ).min(MAX_POLL_DELAY);
+                            }
+                            poll_sleep.as_mut().reset(tokio::time::Instant::now() + poll_delay);
+                        }
+                    }
+
+                    let now_ms = get_now_ms();
+                    kcp_bundle.update(now_ms);
+
+                    // Flush KCP segments via DoH
+                    let segments = kcp_bundle.take_segments();
+                    for seg in segments {
+                        let q = dns_codec::encode_query(&client_id, &seg, &domain, false);
+                        let doh_clone = doh.clone();
+                        let tx = kcp_input_tx.clone();
+                        tokio::spawn(async move {
+                            doh_send_and_feed(&doh_clone, &q, &tx).await;
+                        });
+                    }
+
+                    drain_kcp_to_smux(
+                        &mut kcp_bundle,
+                        &mut noise,
+                        &mut stream_buf,
+                        &mut smux_buf,
+                        &streams,
+                    );
+                }
+            });
+        }
+
+        Ok(Smux2Session {
+            frame_tx: smux_frame_tx,
+            streams,
+            next_sid: AtomicU32::new(1),
+        })
+    }
 }
 
 fn get_now_ms() -> u32 {
@@ -799,8 +1078,11 @@ pub async fn start(
     max_instances: usize,
     running: Arc<AtomicBool>,
     status_tx: Option<mpsc::UnboundedSender<TunnelStatus>>,
+    doh_transport: Option<Arc<doh::DohTransport>>,
 ) -> Result<(), String> {
     if domains.is_empty() { return Err("No DNSTT domains".into()); }
+
+    let use_doh = doh_transport.is_some();
 
     let parsed_resolvers: Vec<SocketAddr> = resolvers.iter()
         .filter_map(|r| {
@@ -808,7 +1090,7 @@ pub async fn start(
             r.parse().ok()
         })
         .collect();
-    if parsed_resolvers.is_empty() { return Err("No valid resolvers".into()); }
+    if !use_doh && parsed_resolvers.is_empty() { return Err("No valid resolvers".into()); }
 
     let mut all_domain_keys: Vec<(String, [u8; 32])> = Vec::new();
     for (domain, pubkey_hex) in &domains {
@@ -835,7 +1117,12 @@ pub async fn start(
         for tried in 0..max_instances {
             let idx = tried % all_domain_keys.len();
             let (domain, pk) = &all_domain_keys[idx];
-            let resolver = parsed_resolvers[resolver_offset % parsed_resolvers.len()];
+            let resolver = if !parsed_resolvers.is_empty() {
+                parsed_resolvers[resolver_offset % parsed_resolvers.len()]
+            } else {
+                // DoH mode: resolver addr is unused for transport but needed by DnsttTunnel struct
+                "0.0.0.0:53".parse().unwrap()
+            };
             resolver_offset += 1;
             let domain = domain.clone();
             let pk = *pk;
@@ -843,32 +1130,45 @@ pub async fn start(
             let sessions = all_sessions.clone();
             let cd = cooldown.clone();
             let stx = status_tx.clone();
+            let doh_clone = doh_transport.clone();
             handles.push(tokio::spawn(async move {
                 let tunnel = DnsttTunnel::new(domain.clone(), pk, resolver);
+                let transport_label = if doh_clone.is_some() { "DoH" } else { &resolver.to_string() };
                 if let Some(ref tx) = stx {
-                    let _ = tx.send(TunnelStatus::Connecting(domain.clone(), resolver.to_string()));
+                    let _ = tx.send(TunnelStatus::Connecting(domain.clone(), transport_label.to_string()));
                 }
-                match tokio::time::timeout(TUNNEL_SETUP_TIMEOUT, tunnel.connect(running)).await {
+                let connect_result = if let Some(ref doh) = doh_clone {
+                    tokio::time::timeout(
+                        TUNNEL_SETUP_TIMEOUT,
+                        tunnel.connect_doh(doh.clone(), running),
+                    ).await
+                } else {
+                    tokio::time::timeout(
+                        TUNNEL_SETUP_TIMEOUT,
+                        tunnel.connect(running),
+                    ).await
+                };
+                match connect_result {
                     Ok(Ok(s)) => {
-                        log::info!("[dnstt] {} connected via {}", domain, resolver);
-                        cd.pin_resolver(resolver);
+                        log::info!("[dnstt] {} connected via {}", domain, transport_label);
+                        if !use_doh { cd.pin_resolver(resolver); }
                         sessions.lock().await.push(Arc::new(
                             TrackedSession::new(Arc::new(s), domain.clone())
                         ));
                         if let Some(ref tx) = stx {
-                            let _ = tx.send(TunnelStatus::Connected(domain, resolver.to_string()));
+                            let _ = tx.send(TunnelStatus::Connected(domain, transport_label.to_string()));
                         }
                     }
                     Ok(Err(e)) => {
-                        log::warn!("[dnstt] {} failed via {}: {}", domain, resolver, e);
-                        cd.cooldown_resolver(resolver);
+                        log::warn!("[dnstt] {} failed via {}: {}", domain, transport_label, e);
+                        if !use_doh { cd.cooldown_resolver(resolver); }
                         if let Some(ref tx) = stx {
                             let _ = tx.send(TunnelStatus::Failed(domain, e));
                         }
                     }
                     Err(_) => {
-                        log::warn!("[dnstt] {} timed out via {}", domain, resolver);
-                        cd.cooldown_resolver(resolver);
+                        log::warn!("[dnstt] {} timed out via {}", domain, transport_label);
+                        if !use_doh { cd.cooldown_resolver(resolver); }
                         if let Some(ref tx) = stx {
                             let _ = tx.send(TunnelStatus::Failed(domain, "timeout".into()));
                         }
@@ -906,10 +1206,33 @@ pub async fn start(
         let sd = running.clone();
         let dk = all_domain_keys.clone();
         let resolvers = parsed_resolvers.clone();
+        let bg_doh = doh_transport.clone();
         tokio::spawn(async move {
             let mut last_rotation = Instant::now();
             let rotation_interval = Duration::from_secs(45 * 60);
             let mut rotation_idx = 0usize;
+
+            // Helper: pick a resolver addr (dummy for DoH mode)
+            let pick_resolver = |pinned: Option<SocketAddr>, offset: usize| -> SocketAddr {
+                if resolvers.is_empty() {
+                    "0.0.0.0:53".parse().unwrap()
+                } else {
+                    pinned.unwrap_or(resolvers[offset % resolvers.len()])
+                }
+            };
+
+            // Helper: connect a tunnel using DoH or UDP
+            async fn reconnect_tunnel(
+                tunnel: &DnsttTunnel,
+                doh: &Option<Arc<doh::DohTransport>>,
+                running: Arc<AtomicBool>,
+            ) -> Result<Smux2Session, String> {
+                if let Some(ref doh) = doh {
+                    tunnel.connect_doh(doh.clone(), running).await
+                } else {
+                    tunnel.connect(running).await
+                }
+            }
 
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
@@ -927,10 +1250,13 @@ pub async fn start(
                 {
                     rotation_idx = (rotation_idx + 1) % dk.len();
                     let (domain, pk) = &dk[rotation_idx];
-                    let resolver = cd.get_pinned().unwrap_or(resolvers[0]);
+                    let resolver = pick_resolver(cd.get_pinned(), 0);
                     let tunnel = DnsttTunnel::new(domain.clone(), *pk, resolver);
                     let sd2 = sd.clone();
-                    if let Ok(Ok(s)) = tokio::time::timeout(TUNNEL_SETUP_TIMEOUT, tunnel.connect(sd2)).await {
+                    if let Ok(Ok(s)) = tokio::time::timeout(
+                        TUNNEL_SETUP_TIMEOUT,
+                        reconnect_tunnel(&tunnel, &bg_doh, sd2),
+                    ).await {
                         let mut guard = sessions.lock().await;
                         if !guard.is_empty() { guard.remove(0); }
                         guard.push(Arc::new(TrackedSession::new(Arc::new(s), domain.clone())));
@@ -949,25 +1275,32 @@ pub async fn start(
                     attempts += 1;
                     let idx = (healthy_count + connected + attempts) % dk.len();
                     let (domain, pk) = &dk[idx];
-                    let resolver = if attempts <= dk.len() {
-                        pinned.unwrap_or(resolvers[0])
-                    } else {
+                    let resolver = if bg_doh.is_some() {
+                        pick_resolver(None, 0)
+                    } else if attempts <= dk.len() {
+                        pick_resolver(pinned, 0)
+                    } else if !resolvers.is_empty() {
                         resolvers[(attempts - dk.len()) % resolvers.len()]
+                    } else {
+                        continue;
                     };
-                    if !cd.is_resolver_available(&resolver) { continue; }
+                    if bg_doh.is_none() && !cd.is_resolver_available(&resolver) { continue; }
 
                     let tunnel = DnsttTunnel::new(domain.clone(), *pk, resolver);
                     let sd2 = sd.clone();
-                    match tokio::time::timeout(TUNNEL_SETUP_TIMEOUT, tunnel.connect(sd2)).await {
+                    match tokio::time::timeout(
+                        TUNNEL_SETUP_TIMEOUT,
+                        reconnect_tunnel(&tunnel, &bg_doh, sd2),
+                    ).await {
                         Ok(Ok(s)) => {
-                            cd.pin_resolver(resolver);
+                            if bg_doh.is_none() { cd.pin_resolver(resolver); }
                             sessions.lock().await.push(Arc::new(
                                 TrackedSession::new(Arc::new(s), domain.clone())
                             ));
                             connected += 1;
                         }
                         Ok(Err(_)) | Err(_) => {
-                            cd.cooldown_resolver(resolver);
+                            if bg_doh.is_none() { cd.cooldown_resolver(resolver); }
                         }
                     }
                 }

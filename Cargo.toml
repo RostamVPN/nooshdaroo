@@ -1,5 +1,5 @@
 [workspace]
-members = ["client", "server"]
+members = ["client", "server", "lb"]
 resolver = "2"
 
 # Client: optimise for size (DNS tunnel = bandwidth-constrained)

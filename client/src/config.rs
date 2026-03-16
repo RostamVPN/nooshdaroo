@@ -81,6 +81,20 @@ impl Config {
         result
     }
 
+    /// Get DoH resolver URLs from config (e.g. OTA-pushed endpoints).
+    /// These are full URLs like "https://dns.google/dns-query".
+    pub fn doh_resolvers(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        if let Some(resolvers) = self.raw["transport"]["dnstt"]["doh_resolvers"].as_array() {
+            for r in resolvers {
+                if let Some(s) = r.as_str() {
+                    result.push(s.to_string());
+                }
+            }
+        }
+        result
+    }
+
     pub fn pick_resolver(&self) -> String {
         let all = self.dnstt_resolvers();
         if all.is_empty() { return "8.8.8.8".to_string(); }

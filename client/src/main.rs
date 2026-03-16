@@ -5,6 +5,7 @@ use std::sync::Arc;
 mod chrome_cover;
 mod config;
 mod dns_codec;
+mod doh;
 mod iran_ranges;
 mod russia_ranges;
 mod spirit;
@@ -56,8 +57,8 @@ struct Args {
     #[arg(long, value_name = "IP")]
     resolver: Option<String>,
 
-    /// Number of parallel tunnels (default: 8)
-    #[arg(long, default_value = "8", value_name = "N")]
+    /// Number of parallel tunnels (default: 2)
+    #[arg(long, default_value = "2", value_name = "N")]
     tunnels: usize,
 
     /// Scan for working DNS resolvers before connecting
@@ -115,6 +116,14 @@ struct Args {
     /// OTA decryption nonce (12 ascii chars) — for ChaCha20-Poly1305
     #[arg(long, value_name = "NONCE")]
     ota_nonce: Option<String>,
+
+    /// Use DNS-over-HTTPS instead of raw UDP (harder to detect, slightly slower)
+    #[arg(long)]
+    doh: bool,
+
+    /// DoH provider: "google", "cloudflare", "quad9", or a custom URL
+    #[arg(long, value_name = "PROVIDER")]
+    doh_provider: Option<String>,
 }
 
 #[tokio::main]
@@ -407,10 +416,37 @@ async fn main() {
     // Get OTA-pushed cover domains
     let ota_cover_domains = cfg.cover_domains();
 
+    // Build DoH transport if requested (CLI flag, CLI provider, or config file)
+    let doh_transport = if args.doh {
+        let providers: Vec<&str> = if let Some(ref p) = args.doh_provider {
+            vec![p.as_str()]
+        } else {
+            vec![] // use all defaults
+        };
+        Some(Arc::new(doh::DohTransport::new(&providers)))
+    } else if !cfg.doh_resolvers().is_empty() {
+        Some(Arc::new(doh::DohTransport::from_urls(&cfg.doh_resolvers())))
+    } else {
+        None
+    };
+
     if !args.quiet {
-        ui::print_status("Transport", "DNSTT (native Rust)");
+        if doh_transport.is_some() {
+            ui::print_status("Transport", "DNSTT over DoH (DNS-over-HTTPS)");
+        } else {
+            ui::print_status("Transport", "DNSTT (native Rust)");
+        }
         ui::print_status("Tunnels", &format!("{} parallel", args.tunnels));
-        ui::print_status("Resolvers", &format!("{} available", resolvers.len()));
+        if doh_transport.is_some() {
+            let doh_ref = doh_transport.as_ref().unwrap();
+            ui::print_status("DoH", &format!(
+                "{} providers ({})",
+                doh_ref.provider_count(),
+                doh_ref.provider_urls().join(", ")
+            ));
+        } else {
+            ui::print_status("Resolvers", &format!("{} available", resolvers.len()));
+        }
         ui::print_status("Domains", &format!("{} selected (DNS flux)", domains.len()));
         if !args.no_cover {
             if ota_cover_domains.is_empty() {
@@ -503,6 +539,7 @@ async fn main() {
         args.tunnels,
         running.clone(),
         Some(status_tx),
+        doh_transport,
     ).await {
         Ok(()) => {}
         Err(e) => {
