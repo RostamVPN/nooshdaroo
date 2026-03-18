@@ -1,0 +1,22 @@
+{
+  "transport": {
+    "dnstt": {
+      "domains": [
+        {
+          "domain": "t.example.com",
+          "pubkey": "567b3079ff2371db586125665cdd2d5ea633dad5f99b6199c07ccd5ac1410026"
+        }
+      ],
+      "udp_resolvers": [
+        "8.8.8.8",
+        "1.1.1.1",
+        "9.9.9.9"
+      ]
+    }
+  },
+  "cover_domains": [
+    "www.google.com",
+    "www.youtube.com",
+    "www.wikipedia.org"
+  ]
+}

@@ -1,0 +1,11 @@
+[workspace]
+members = ["client", "server", "lb", "liteweb"]
+resolver = "2"
+
+# Client: optimise for size (DNS tunnel = bandwidth-constrained)
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
